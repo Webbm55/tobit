@@ -1,3 +1,16 @@
+"""Maximum-likelihood Tobit regression for censored data.
+
+This module implements Tobit regression (censored regression) using maximum
+likelihood estimation. It handles left-censored, right-censored, and uncensored
+observations to model dependent variables with censoring limits.
+
+Typical usage example:
+
+  model = TobitModel(fit_intercept=True)
+  model.fit(X, y, censoring_indicators)
+  predictions = model.predict(X_test)
+"""
+
 import math
 import warnings
 
@@ -11,6 +24,20 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 
 
 def split_left_right_censored(x, y, cens):
+    """Partitions data into left-censored, uncensored, and right-censored subsets.
+
+    Args:
+        x: DataFrame of predictor variables.
+        y: Series of target variable values.
+        cens: Series with censoring indicators (-1: left, 0: none, 1: right).
+
+    Returns:
+        Tuple of (xs, ys) where each is a list of [left, middle, right] arrays.
+        Elements are None if no observations exist for that censoring type.
+
+    Warns:
+        UserWarning: If no censored observations exist in the data.
+    """
     counts = cens.value_counts()
     if -1 not in counts and 1 not in counts:
         warnings.warn("No censored observations; use regression methods for uncensored data")
@@ -31,11 +58,23 @@ def split_left_right_censored(x, y, cens):
 
 
 def tobit_neg_log_likelihood(xs, ys, params):
+    """Computes negative log-likelihood for Tobit model.
+
+    Uses censored normal distribution for censored observations and standard
+    normal density for uncensored observations.
+
+    Args:
+        xs: List of [left, middle, right] predictor arrays from split_left_right_censored.
+        ys: List of [left, middle, right] target arrays from split_left_right_censored.
+        params: Array of model parameters [coefficients..., sigma].
+
+    Returns:
+        Negative log-likelihood value for optimization.
+    """
     x_left, x_mid, x_right = xs
     y_left, y_mid, y_right = ys
 
     b = params[:-1]
-    # s = math.exp(params[-1])
     s = params[-1]
 
     to_cat = []
@@ -51,13 +90,14 @@ def tobit_neg_log_likelihood(xs, ys, params):
         to_cat.append(right)
     if cens:
         concat_stats = np.concatenate(to_cat, axis=0) / s
-        log_cum_norm = scipy.stats.norm.logcdf(concat_stats)  # log_ndtr(concat_stats)
+        log_cum_norm = scipy.stats.norm.logcdf(concat_stats)
         cens_sum = log_cum_norm.sum()
     else:
         cens_sum = 0
 
     if y_mid is not None:
         mid_stats = (y_mid - np.dot(x_mid, b)) / s
+        # Prevent log(0) by enforcing minimum sigma value
         mid = scipy.stats.norm.logpdf(mid_stats) - math.log(max(np.finfo('float').resolution, s))
         mid_sum = mid.sum()
     else:
@@ -69,11 +109,23 @@ def tobit_neg_log_likelihood(xs, ys, params):
 
 
 def tobit_neg_log_likelihood_der(xs, ys, params):
+    """Computes gradient of negative log-likelihood for Tobit model.
+
+    Calculates partial derivatives with respect to coefficients and sigma
+    for use in gradient-based optimization.
+
+    Args:
+        xs: List of [left, middle, right] predictor arrays from split_left_right_censored.
+        ys: List of [left, middle, right] target arrays from split_left_right_censored.
+        params: Array of model parameters [coefficients..., sigma].
+
+    Returns:
+        Array of gradient values [d/dcoef1, ..., d/dsigma].
+    """
     x_left, x_mid, x_right = xs
     y_left, y_mid, y_right = ys
 
     b = params[:-1]
-    # s = math.exp(params[-1]) # in censReg, not using chain rule as below; they optimize in terms of log(s)
     s = params[-1]
 
     beta_jac = np.zeros(len(b))
@@ -83,6 +135,7 @@ def tobit_neg_log_likelihood_der(xs, ys, params):
         left_stats = (y_left - np.dot(x_left, b)) / s
         l_pdf = scipy.stats.norm.logpdf(left_stats)
         l_cdf = log_ndtr(left_stats)
+        # Inverse Mills ratio for left-censored observations
         left_frac = np.exp(l_pdf - l_cdf)
         beta_left = np.dot(left_frac, x_left / s)
         beta_jac -= beta_left
@@ -94,6 +147,7 @@ def tobit_neg_log_likelihood_der(xs, ys, params):
         right_stats = (np.dot(x_right, b) - y_right) / s
         r_pdf = scipy.stats.norm.logpdf(right_stats)
         r_cdf = log_ndtr(right_stats)
+        # Inverse Mills ratio for right-censored observations
         right_frac = np.exp(r_pdf - r_cdf)
         beta_right = np.dot(right_frac, x_right / s)
         beta_jac += beta_right
@@ -109,13 +163,34 @@ def tobit_neg_log_likelihood_der(xs, ys, params):
         mid_sigma = (np.square(mid_stats) - 1).sum()
         sigma_jac += mid_sigma
 
-    combo_jac = np.append(beta_jac, sigma_jac / s)  # by chain rule, since the expression above is dloglik/dlogsigma
+    combo_jac = np.append(beta_jac, sigma_jac / s)
 
     return -combo_jac
 
 
 class TobitModel:
+    """Maximum-likelihood estimator for Tobit (censored) regression.
+
+    Fits a regression model for data with left-censored, right-censored, or
+    uncensored observations using BFGS optimization of the log-likelihood.
+    Initializes parameters using OLS on all observations.
+
+    Attributes:
+        fit_intercept: Whether to fit an intercept term.
+        ols_coef_: OLS coefficients used for initialization.
+        ols_intercept: OLS intercept used for initialization.
+        coef_: Fitted Tobit coefficients (excluding intercept).
+        intercept_: Fitted Tobit intercept.
+        sigma_: Fitted standard deviation of residuals.
+    """
+
     def __init__(self, fit_intercept=True):
+        """Initializes TobitModel with intercept configuration.
+
+        Args:
+            fit_intercept: If True, fits intercept term. If False, assumes
+                data is centered.
+        """
         self.fit_intercept = fit_intercept
         self.ols_coef_ = None
         self.ols_intercept = None
@@ -124,13 +199,19 @@ class TobitModel:
         self.sigma_ = None
 
     def fit(self, x, y, cens, verbose=False):
-        """
-        Fit a maximum-likelihood Tobit regression
-        :param x: Pandas DataFrame (n_samples, n_features): Data
-        :param y: Pandas Series (n_samples,): Target
-        :param cens: Pandas Series (n_samples,): -1 indicates left-censored samples, 0 for uncensored, 1 for right-censored
-        :param verbose: boolean, show info from minimization
-        :return:
+        """Fits maximum-likelihood Tobit regression model.
+
+        Uses OLS for initialization, then optimizes log-likelihood with BFGS.
+        Handles left-censored (-1), uncensored (0), and right-censored (1) data.
+
+        Args:
+            x: DataFrame (n_samples, n_features) of predictor variables.
+            y: Series (n_samples,) of target values.
+            cens: Series (n_samples,) of censoring indicators (-1, 0, or 1).
+            verbose: If True, displays optimization details.
+
+        Returns:
+            Self with fitted parameters (coef_, intercept_, sigma_).
         """
         x_copy = x.copy()
         if self.fit_intercept:
@@ -153,7 +234,7 @@ class TobitModel:
         self.ols_coef_ = b0[1:]
         self.ols_intercept = b0[0]
         if self.fit_intercept:
-            self.intercept_ = result.x[0] #Replaced result.x[1] which was returning the coef
+            self.intercept_ = result.x[0]
             self.coef_ = result.x[1:-1]
         else:
             self.coef_ = result.x[:-1]
@@ -162,8 +243,26 @@ class TobitModel:
         return self
 
     def predict(self, x):
+        """Predicts target values using fitted coefficients.
+
+        Args:
+            x: DataFrame (n_samples, n_features) of predictor variables.
+
+        Returns:
+            Array of predicted values.
+        """
         return self.intercept_ + np.dot(x, self.coef_)
 
     def score(self, x, y, scoring_function=mean_absolute_error):
+        """Evaluates model predictions using specified metric.
+
+        Args:
+            x: DataFrame (n_samples, n_features) of predictor variables.
+            y: Series (n_samples,) of true target values.
+            scoring_function: Metric function (default: mean_absolute_error).
+
+        Returns:
+            Score computed by scoring_function(y_true, y_pred).
+        """
         y_pred = np.dot(x, self.coef_)
         return scoring_function(y, y_pred)
